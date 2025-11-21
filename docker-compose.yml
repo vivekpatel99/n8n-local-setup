@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   n8n:
     image: n8nio/n8n:latest
@@ -5,20 +7,93 @@ services:
     ports:
       - "5678:5678"
     environment:
+      # Basic Configuration
       - GENERIC_TIMEZONE=CET
+      - TZ=CET
       - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
-      - N8N_RUNNERS_ENABLED=true
-      - N8N_DEFAULT_BINARY_DATA_MODE=filesystem
-      - N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE=true
-      - N8N_MAX_EXECUTION_TIMEOUT=3600
-      - N8N_BINARY_DATA_TTL=3600
       - N8N_HOST=localhost
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
+
+      # Task Runners (AI/Code execution)
+      - N8N_RUNNERS_ENABLED=true
+      - N8N_RUNNERS_MODE=internal
+
+      # Memory Configuration (dynamic scaling)
+      # Node.js will use minimal memory when idle, scales up to 3GB for workflows
+      - NODE_OPTIONS=--max-old-space-size=3072 --max-semi-space-size=128
+
+      # Security Settings
+      - N8N_GIT_NODE_DISABLE_BARE_REPOS=true
+      - N8N_BLOCK_FILE_ACCESS_TO_N8N_FILES=true
+
+      # Code Node Module Access
+      - NODE_FUNCTION_ALLOW_BUILTIN=*
+      - NODE_FUNCTION_ALLOW_EXTERNAL=moment,lodash,axios,crypto-js,cheerio,puppeteer
+
+      # Binary Data Storage
+      - N8N_DEFAULT_BINARY_DATA_MODE=filesystem
+      - N8N_AVAILABLE_BINARY_DATA_MODES=filesystem,default
+      - N8N_BINARY_DATA_STORAGE_PATH=/home/node/.n8n/binary-data
+
+      # Execution & Data Management
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=none
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+      - EXECUTIONS_DATA_SAVE_ON_PROGRESS=false
+      - EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS=false
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=168  # 7 days
+      - EXECUTIONS_DATA_PRUNE_MAX_COUNT=50000
+      - N8N_DATA_TABLES_MAX_SIZE_BYTES=100000000  # 100MB
+
+      # Workflow Execution Settings
+      - EXECUTIONS_TIMEOUT=7200  # 2 hours
+      - EXECUTIONS_TIMEOUT_MAX=10800  # 3 hours
+      - N8N_MAX_EXECUTION_TIMEOUT=3600
+      - N8N_PAYLOAD_SIZE_MAX=268435456  # 256MB
+
+      # Workflow Performance (optimized for dynamic resource usage)
+      - EXECUTIONS_PROCESS=main
+      - N8N_CONCURRENCY_PRODUCTION_LIMIT=10
+      - N8N_GRACEFUL_SHUTDOWN_TIMEOUT=30
+
+      # Performance Tuning (helps with resource efficiency)
+      - NODE_ENV=production
+
+      # Logging
+      - N8N_LOG_LEVEL=info
+      - N8N_LOG_OUTPUT=console,file
+      - N8N_LOG_FILE_LOCATION=/home/node/.n8n/logs/n8n.log
+      - N8N_LOG_FILE_MAXSIZE=50
+      - N8N_LOG_FILE_MAXCOUNT=30
+
+      # Community Packages
+      - N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE=true
+
+      # Webhook Configuration (for scheduled workflows)
+      - WEBHOOK_URL=http://localhost:5678/
+
     volumes:
       - /home/ultron/n8n_data:/home/node/.n8n
+      - ./backups:/backups
+      - .:/workspace
 
+    user: "1000:1000"
     restart: unless-stopped
+
+    # Dynamic Resource Allocation
+    # - Idle: Uses ~512MB RAM, minimal CPU (only what's needed)
+    # - Active workflows: Scales up to 4G RAM and 6 CPU cores automatically
+    # - Docker manages scaling between reservation (minimum) and limit (maximum)
+    deploy:
+      resources:
+        limits:
+          cpus: "6.0"        # Maximum CPU cores when workflows are running
+          memory: 4G         # Maximum memory for heavy workflows
+        reservations:
+          cpus: "0.5"        # Minimum CPU reservation (very light when idle)
+          memory: 512M       # Minimum memory reservation (bare minimum when idle)
+
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5678/healthz || exit 1"]
       interval: 30s
@@ -26,5 +101,39 @@ services:
       retries: 3
       start_period: 40s
 
+    networks:
+      - n8n-network
 
+  # Automatic Backup Service
+  n8n-backup:
+    image: alpine:latest
+    container_name: n8n-backup
+    volumes:
+      - /home/ultron/n8n_data:/data:ro
+      - ./backups:/backups
+    environment:
+      - BACKUP_KEEP_DAYS=7
+      - BACKUP_INTERVAL=86400  # Daily backups
+    entrypoint: /bin/sh
+    command: >
+      -c "
+      while true; do
+        timestamp=$$(date +%Y%m%d_%H%M%S);
+        echo \"Creating backup: n8n_backup_$$timestamp.tar.gz\";
+        tar -czf /backups/n8n_backup_$$timestamp.tar.gz -C /data .;
+        echo \"Backup completed: n8n_backup_$$timestamp.tar.gz\";
+        find /backups -name 'n8n_backup_*.tar.gz' -mtime +$$BACKUP_KEEP_DAYS -delete;
+        echo \"Old backups cleaned up. Sleeping for $$BACKUP_INTERVAL seconds...\";
+        sleep $$BACKUP_INTERVAL;
+      done
+      "
+    restart: unless-stopped
+    networks:
+      - n8n-network
+    depends_on:
+      - n8n
+
+networks:
+  n8n-network:
+    driver: bridge
 
